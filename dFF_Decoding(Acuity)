@@ -1,0 +1,345 @@
+%% ================= PREPROCESSING & ROI SELECTION =================
+% This script:
+% 1. Defines the stimulus sequence (SFs)
+% 2. Computes per-trial dF/F traces
+% 3. Selects ROIs using fixed criteria
+% 4. Saves clean outputs for decoding
+
+
+%% Load F.mat
+
+
+% ---------------- Parameters ----------------
+preFrames  = 60;
+postFrames = 150;
+stimWindow = 61:121;   % 0–60 frames post-onset
+alphaNeu   = 0.7;
+
+% ---------------- Stimulus Sequence ----------------
+% ===== USE *ONE* OF THE FOLLOWING BLOCKS =====
+
+% ---- 70-stim version ----
+% SFs = [ ...
+%     0 1 4 5 1 0 6 0 5 3 2 1 3 6 2 4 6 4 6 0 ...
+%     2 3 6 1 4 6 2 3 2 1 1 3 1 5 5 0 ...
+%     5 4 5 2 4 3 2 5 2 2 4 1 6 1 0 4 ...
+%     5 4 6 3 3 0 0 0 5 6 5 3 6 0 2 1 4 3];
+
+% % ---- 105-stim version ----
+SFs = [0 3 6 2 4 0 0 1 5 2 6 5 3 3 4 4 0 4 3 6 ...
+       1 2 5 0 6 1 2 6 4 2 4 4 5 2 4 5 6 6 3 5 ...
+       6 5 2 1 2 2 4 1 5 4 0 1 4 1 2 3 5 2 0 4 ...
+       4 2 3 0 6 4 1 2 5 0 6 0 3 6 1 3 5 0 6 0 ...
+       1 6 3 5 3 1 1 4 0 1 0 1 2 0 3 5 6 1 3 2 ...
+       3 5 3 6 5];
+
+% Drop first dummy entry (matches your original code)
+SFs = SFs(2:end);
+stimuli = unique(SFs);
+nTrials = numel(SFs);
+
+% ---------------- Onset Calculation ----------------
+tiffLengths = ops.frames_per_file;
+tiffLengths = tiffLengths(tiffLengths >= 10);
+
+onsets = cumsum([1 tiffLengths]);
+if numel(onsets) > 2
+    onsets = onsets(2:end-1);
+end
+
+assert(numel(onsets) == nTrials, ...
+    'Mismatch between number of onsets and number of trials');
+
+% ---------------- ΔF/F Extraction ----------------
+traceLength = preFrames + postFrames + 1;
+nROIs = size(F,1);
+
+allTraces = nan(nTrials, traceLength, nROIs);
+
+for r = 1:nROIs
+    Fcorr = F(r,:) - alphaNeu * Fneu(r,:);
+    for t = 1:nTrials
+        o = onsets(t);
+        baseline = mean(Fcorr(o-30:o-1));
+        allTraces(t,:,r) = ...
+            (Fcorr(o-preFrames:o+postFrames) - baseline) ./ baseline;
+    end
+end
+
+% ---------------- Mean Responses ----------------
+Responses = squeeze(mean(allTraces(:,stimWindow,:), 2)); % [Trials × ROIs]
+
+% ---------------- ROI Responsiveness Test ----------------
+Presponse = nan(numel(stimuli), nROIs);
+meanResp  = nan(numel(stimuli), nROIs);
+
+for r = 1:nROIs
+    Rcontrol = Responses(SFs == 0, r);
+    for s = 1:numel(stimuli)
+        stim = stimuli(s);
+        if stim == 0, continue; end
+        Rstim = Responses(SFs == stim, r);
+        Presponse(s,r) = ranksum(Rstim, Rcontrol, "Tail","right");
+        meanResp(s,r)  = mean(Rstim);
+    end
+end
+
+% ---------------- ROI Inclusion (UNCHANGED) ----------------
+isResponsive = any(Presponse(2:end,:) < 0.05/6);
+isBig        = any(meanResp(2:end,:) > 0.15);
+isIncluded  = isResponsive & isBig;
+
+includedROIs = find(isIncluded);
+
+fprintf('Included ROIs: %d / %d\n', numel(includedROIs), nROIs);
+
+% ---------------- Save ----------------
+save('PreprocessedData.mat', ...
+    'allTraces', 'SFs', 'stimuli', 'includedROIs', ...
+    'Presponse', 'meanResp', 'preFrames', 'postFrames');
+
+%% ================= RUN DECODING =================
+
+% load('PreprocessedData.mat');
+
+stimA = 0;
+stimB = 3; %adjust as needed,
+
+bin_width = 5;
+step_size = 2;
+num_cv_splits = 5;
+num_resamples = 100;
+
+raster_dir = 'Raster_Stim0_vs_2';
+if ~exist(raster_dir,'dir'), mkdir(raster_dir); end
+
+validTrials = SFs == stimA | SFs == stimB;
+labels = strings(sum(validTrials),1);
+labels(SFs(validTrials)==stimA) = "Background";
+labels(SFs(validTrials)==stimB) = "Stimulus_2";
+
+for i = 1:numel(includedROIs)
+    roi = includedROIs(i);
+    raster_data = squeeze(allTraces(validTrials,:,roi));
+    raster_labels.stimulus_ID = cellstr(labels);
+    raster_site_info.recording_channel = roi;
+    raster_site_info.is_included = 1;
+    save(fullfile(raster_dir, sprintf('site_%03d.mat', roi)), ...
+        'raster_data', 'raster_labels', 'raster_site_info');
+end
+
+binned_file = create_binned_data_from_raster_data( ...
+    raster_dir, 'Binned_Stim0_vs_2', bin_width, step_size);
+
+ds = basic_DS(binned_file, 'stimulus_ID', num_cv_splits);
+cl = max_correlation_coefficient_CL;
+fps = {zscore_normalize_FP};
+
+cv = standard_resample_CV(ds, cl, fps);
+cv.num_resample_runs = num_resamples;
+
+DECODING_RESULTS = cv.run_cv_decoding;
+
+save('DecodingResults_Stim0_vs_2.mat', ...
+     'DECODING_RESULTS', 'bin_width', 'step_size', 'preFrames');
+
+%% ================= EXTRACT DECODING METRIC =================
+
+% load('DecodingResults_Stim0_vs_2.mat');
+
+num_points = size( ...
+    DECODING_RESULTS.ZERO_ONE_LOSS_RESULTS.mean_decoding_results, 1);
+
+time_axis = (-preFrames + bin_width/2) + (0:num_points-1)*step_size;
+
+accuracy = diag( ...
+    DECODING_RESULTS.ZERO_ONE_LOSS_RESULTS.mean_decoding_results) * 100;
+
+mask = time_axis >= 0 & time_axis <= 30;
+auc_above_chance = trapz(time_axis(mask), max(accuracy(mask)-50, 0));
+peak_post_onset  = max(accuracy(time_axis > 0));
+
+fprintf('\n===== FINAL DECODING METRICS =====\n');
+fprintf('AUC (0–30, above chance): %.2f\n', auc_above_chance);
+fprintf('Peak accuracy post-onset: %.2f%%\n', peak_post_onset);
+
+save('FinalDecodingMetric.mat', ...
+     'auc_above_chance', 'peak_post_onset');
+
+%% Plotting of Traces
+
+% 1. Setup and Initialization
+% ---------------------------------------------------------
+folderName = 'DecoderPilotCA';
+files = dir(fullfile(folderName, '*.mat'));
+
+if isempty(files)
+    error('No .mat files found in folder: %s', folderName);
+end
+
+% Binning Parameters (Must match your decoding settings)
+bin_width = 5;
+step_size = 2;
+start_time = -60;
+
+% We need to load one file first to determine the vector size for pre-allocation
+firstData = load(fullfile(folderName, files(1).name), 'DECODING_RESULTS');
+num_points = size(firstData.DECODING_RESULTS.ZERO_ONE_LOSS_RESULTS.mean_decoding_results, 1);
+num_files = length(files);
+
+% Pre-allocate matrix: Rows = Time Points, Cols = Files
+all_traces = nan(num_points, num_files);
+
+% Reconstruct the Time Axis (Center of each bin)
+time_axis = (start_time + bin_width/2) + (0:num_points-1) * step_size;
+
+% 2. Loop to Extract Data
+% ---------------------------------------------------------
+disp(['Extracting data from ' num2str(num_files) ' files...']);
+
+for i = 1:num_files
+    fileName = files(i).name;
+    fullPath = fullfile(folderName, fileName);
+    
+    % Load data
+    data = load(fullPath, 'DECODING_RESULTS');
+    
+    % Extract Diagonal and Convert to Percentage
+    if isfield(data, 'DECODING_RESULTS')
+        diag_acc = diag(data.DECODING_RESULTS.ZERO_ONE_LOSS_RESULTS.mean_decoding_results);
+        all_traces(:, i) = diag_acc * 100;
+    else
+        warning('File %s is missing DECODING_RESULTS. Filling with NaNs.', fileName);
+    end
+end
+
+% 3. Compute Statistics (Mean and SEM)
+% ---------------------------------------------------------
+% Calculate Mean across columns (dim 2)
+mean_trace = mean(all_traces, 2, 'omitnan');
+
+% Calculate Standard Error of the Mean (SEM = STD / sqrt(N))
+std_trace = std(all_traces, 0, 2, 'omitnan');
+sem_trace = std_trace / sqrt(num_files);
+
+% Define Upper and Lower bounds for SEM
+upper_bound = mean_trace + sem_trace;
+lower_bound = mean_trace - sem_trace;
+
+% 4. Generate the Plot
+% ---------------------------------------------------------
+figure('Color', 'w', 'Position', [100 100 800 500]);
+hold on;
+
+% A. Plot Individual Traces (Grey Background)
+% We plot the whole matrix at once. MATLAB treats columns as separate lines.
+plot(time_axis, all_traces, 'Color', [0.8 0.8 0.8], 'LineWidth', 1);
+
+% B. Plot Mean Trace (Black Foreground)
+hMean = plot(time_axis, mean_trace, 'k', 'LineWidth', 2.5);
+
+% C. Plot SEM (Dotted Lines)
+hSEM = plot(time_axis, upper_bound, 'k:', 'LineWidth', 2);
+plot(time_axis, lower_bound, 'k:', 'LineWidth', 2);
+
+% D. Formatting and Reference Lines
+yline(50, 'r--', 'Chance (50%)', 'LineWidth', 1.5);
+xline(0, 'r--', 'Onset', 'LineWidth', 1.5);
+
+% Labels
+title(sprintf('Population Decoding Performance (N=%d Datasets)', num_files));
+xlabel('Time from Onset (frames)');
+ylabel('Decoding Accuracy (%)');
+ylim([30 100]); % Adjust based on your data range
+xlim([-30 80]); % Zoom in on the epoch of interest
+
+% Optional: Add a Legend
+legend([hMean, hSEM], {'Mean Accuracy', 'Mean \pm SEM'}, 'Location', 'Best');
+
+grid on;
+box off;
+set(gca, 'FontSize', 12);
+hold off;
+
+disp('Plot generated successfully.');
+
+%% New plot with labels
+
+% 1. Setup and Initialization
+% ---------------------------------------------------------
+folderName = 'DecoderPilotCA';
+files = dir(fullfile(folderName, '*.mat'));
+
+if isempty(files)
+    error('No .mat files found in folder: %s', folderName);
+end
+
+% Binning Parameters (Must match your decoding settings)
+bin_width = 5;
+step_size = 2;
+start_time = -60;
+
+% We need to load one file first to determine the vector size for pre-allocation
+firstData = load(fullfile(folderName, files(1).name), 'DECODING_RESULTS');
+num_points = size(firstData.DECODING_RESULTS.ZERO_ONE_LOSS_RESULTS.mean_decoding_results, 1);
+num_files = length(files);
+
+% Pre-allocate matrix: Rows = Time Points, Cols = Files
+all_traces = nan(num_points, num_files);
+
+% Reconstruct the Time Axis (Center of each bin)
+time_axis = (start_time + bin_width/2) + (0:num_points-1) * step_size;
+
+% 2. Loop to Extract Data
+% ---------------------------------------------------------
+disp(['Extracting data from ' num2str(num_files) ' files...']);
+
+% Initialize a cell array to store filenames for the Table
+file_labels = cell(num_files, 1);
+
+for i = 1:num_files
+    fileName = files(i).name;
+    file_labels{i} = fileName; % Save filename for the label column
+    
+    fullPath = fullfile(folderName, fileName);
+    data = load(fullPath, 'DECODING_RESULTS');
+    
+    if isfield(data, 'DECODING_RESULTS')
+        diag_acc = diag(data.DECODING_RESULTS.ZERO_ONE_LOSS_RESULTS.mean_decoding_results);
+        all_traces(:, i) = diag_acc * 100;
+    else
+        warning('File %s is missing data.', fileName);
+    end
+end
+
+% --- NEW OUTPUT VARIABLES ---
+
+% A. The Table (Best for mixed data: Name + 104 data points)
+% We transpose all_traces to get [N x 104] and join with labels
+T = array2table(all_traces');
+outputTable = addvars(T, file_labels, 'Before', 1);
+outputTable.Properties.VariableNames{1} = 'SourceFile';
+
+% B. The Double Matrix (Only if you extract numbers from filenames)
+% Example: Extracts '12' from 'Session_12.mat'
+numeric_ids = cellfun(@(x) str2double(regexp(x, '\d+', 'match', 'once')), file_labels);
+outputMatrix = [numeric_ids, all_traces']; % Result: [N x 105] double
+
+% Save results to a .mat file
+% save('Decoding_Output_Summary.mat', 'outputTable', 'outputMatrix');
+
+% 3. Compute Statistics (Mean and SEM)
+% ---------------------------------------------------------
+% Calculate Mean across columns (dim 2)
+mean_trace = mean(all_traces, 2, 'omitnan');
+
+% Calculate Standard Error of the Mean (SEM = STD / sqrt(N))
+std_trace = std(all_traces, 0, 2, 'omitnan');
+sem_trace = std_trace / sqrt(num_files);
+
+% Define Upper and Lower bounds for SEM
+upper_bound = mean_trace + sem_trace;
+lower_bound = mean_trace - sem_trace;
+
+mean_trace = mean_trace';
+

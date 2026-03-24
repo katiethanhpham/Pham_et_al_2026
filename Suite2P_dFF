@@ -1,0 +1,139 @@
+
+% STEP 1: TIFF frame cleanup and onset calculation
+tiffLengths = ops.frames_per_file; 
+tiffLengths = tiffLengths(tiffLengths >= 10);
+onsets = cumsum([1 tiffLengths]);
+if numel(onsets) > 2
+    onsets = onsets(2:end-1);
+end
+
+% STEP 2: Define stimulus sequence
+%70 stims
+SFs = [0 1 4 5 1 0 6 0 5 3 2 1 3 6 2 4 6 4 6 0 2 3 6 1 4 6 2 3 2 1 1 3 1 5 5 0 ...
+       5 4 5 2 4 3 2 5 2 2 4 1 6 1 0 4 5 4 6 3 3 0 0 0 5 6 5 3 6 0 2 1 4 3];
+
+%105 stims
+% SFs = [0	3	6	2	4	0	0	1	5	2	6	5	3	3	4	4	0	4	3	6	1	2	5	0	6	1	2	6	4	2	4	4	5	2	4	5	6	6	3	5	6	5	2	1	2	2	4	1	5	4	0	1	4	1	2	3	5	2	0	4	4	2	3	0	6	4	1	2	5	0	6	0	3	6	1	3	5	0	6	0	1	6	3	5	3	1	1	4	0	1	0	1	2	0	3	5	6	1	3	2	3	5	3	6	5];
+
+
+SFs = SFs(2:end);  
+stimuli = unique(SFs);
+
+% STEP 3: Helper for ΔF/F0
+compute_dff = @(Fcorr, onsets) arrayfun(@(o) ...
+    (Fcorr(o-60:o+150) - mean(Fcorr(o-30:o-1))) / mean(Fcorr(o-30:o-1)), ...
+    onsets, 'UniformOutput', false);
+
+% STEP 4: Extract ROI responses
+nROIs = size(F,1);
+Responses = nan(length(SFs), nROIs);
+
+for roiin = 1:nROIs
+    Fcorr = F(roiin,:) - 0.7 * Fneu(roiin,:);
+    traces = cell2mat(compute_dff(Fcorr, onsets)');
+    Responses(:, roiin) = mean(traces(:,61:151), 2); %change dff window: 60fr (61:121) for acuity, 90fr (61:151) for contrast
+end
+
+% STEP 5: Statistical testing for responsiveness
+Presponse = nan(length(stimuli), nROIs);
+meanResp = nan(length(stimuli), nROIs);
+
+for roiin = 1:nROIs
+    Rcontrol = Responses(SFs == 0, roiin);
+    for stimin = 1:length(stimuli)
+        stim = stimuli(stimin);
+        if stim == 0, continue; end
+        Rstimulus = Responses(SFs == stim, roiin);
+        [p, ~] = ranksum(Rstimulus, Rcontrol, "Tail","right");
+        Presponse(stimin, roiin) = p;
+        meanResp(stimin, roiin) = mean(Rstimulus);
+    end
+end
+
+% STEP 6: Identify included ROIs
+isResponsive = any(Presponse(2:end,:) < 0.05/6);
+isBig = any(meanResp(2:end,:) > 0.15);
+isIncluded = isResponsive & isBig;
+includedROIs = find(isIncluded);
+
+% NEW STEP 6.5: Extract all traces for included ROIs (No averaging)
+% Initialize 3D matrix: [Trials x Timepoints x Neurons]
+% Timepoints is 211 because the window is -60 to +150 frames
+numIncluded = length(includedROIs);
+numTrials = length(SFs); % Should be 69
+traceLength = 211; 
+
+allTraces = nan(numTrials, traceLength, numIncluded);
+
+for i = 1:numIncluded
+    roiin = includedROIs(i);
+    
+    % 1. Neuropil subtraction
+    Fcorr = F(roiin,:) - 0.7 * Fneu(roiin,:);
+    
+    % 2. Get the dF/F0 traces for all 69 trials
+    % This returns a [69 x 211] matrix for this specific neuron
+    current_traces = cell2mat(compute_dff(Fcorr, onsets)');
+    
+    % 3. Store in the 3D matrix
+    allTraces(:, :, i) = current_traces;
+end
+
+% STEP 7: Compute mean ΔF/F0 traces per stimulus for included ROIs
+meanroi = cell(1, nROIs);
+for roiin = includedROIs
+    Fcorr = F(roiin,:) - 0.7 * Fneu(roiin,:);
+    traces = cell2mat(compute_dff(Fcorr, onsets)');
+    mean_results = cell(size(stimuli));
+    for i = 1:length(stimuli)
+        stim = stimuli(i);
+        mean_results{i} = mean(traces(SFs == stim,:), 1);
+    end
+    meanroi{roiin} = mean_results;
+end
+
+% STEP 8: Combine mean traces across ROIs per stimulus
+meanAll = cell(1, length(stimuli));
+for i = 1:length(stimuli)
+    roiTraces = cellfun(@(x) x{i}, meanroi(includedROIs), 'UniformOutput', false);
+    meanAll{i} = cell2mat(roiTraces');
+end
+
+% STEP 9: Binary significance map
+Presponse_bin = Presponse;
+for col = 1:size(Presponse_bin, 2)
+    if isIncluded(col) == 0
+        Presponse_bin(:, col) = 0;
+    else
+        Presponse_bin(Presponse_bin(:,col) > 0.05/6, col) = 0;
+    end
+end
+Presponse_bin = Presponse_bin(2:end, :)';
+Presponse_bin(all(Presponse_bin == 0, 2), :) = [];
+
+
+% STEP 11: Combine into structure
+Results = struct();
+Results.Presponse = Presponse;
+Results.Presponse_bin = Presponse_bin;
+Results.isIncluded = isIncluded;
+Results.includedROIs = includedROIs; % Helpful to keep track of which ID belongs to which trace
+Results.meanAll = meanAll;
+Results.allTraces = allTraces; 
+
+% ---------------------
+
+% STEP 12: Combine across stimuli (optional)
+% numCols = 7; 
+% combinedMatrix = [];
+% for i = 1:numCols
+%     combinedMatrix(:, i) = Results.peakAll{1, i};
+% end
+
+%%
+% STEP 13: Save Results to the current working directory
+% Create a generic file name (you can change 'Session_Results.mat' to whatever you prefer)
+saveName = 'M20d4r4.mat'; %adjust file name
+savePath = fullfile(pwd, saveName);
+save(savePath, 'Results');
+clear; clc;

@@ -1,0 +1,393 @@
+%% 1. Setup
+% Specify the folder path (use '.' if the files are in the current folder)
+folderPath = uigetdir(pwd, 'Select the PeriNRafter folder');
+
+% Get a list of all .mat files in the folder
+fileList = dir(fullfile(folderPath, '*.mat'));
+
+% Initialize the container for the final combined data.
+% We create a 1x7 cell array, initially empty.
+combinedMeanAll = cell(1, 7);
+
+% Processing
+fprintf('Found %d files. Starting combination...\n', length(fileList));
+
+for k = 1:length(fileList)
+    % 1. Get the full filename
+    thisFileName = fullfile(fileList(k).folder, fileList(k).name);
+    
+    % 2. Load the .mat file
+    % We load it into a structure 'loadedData' to avoid variable name conflicts
+    loadedData = load(thisFileName);
+    
+    % Check if 'Results' exists in this file to prevent errors
+    if isfield(loadedData, 'Results')
+        
+        % Extract the meanAll cell array (1x7)
+        currentMeanAll = loadedData.Results.meanAll;
+        
+        % 3. Loop through each of the 7 cells
+        for c = 1:7
+            % Vertically concatenate the existing data with the new data.
+            % [A; B] puts the rows of B below the rows of A.
+            combinedMeanAll{c} = [combinedMeanAll{c}; currentMeanAll{c}];
+        end
+        
+    else
+        warning('File %s does not contain the "Results" variable. Skipped.', fileList(k).name);
+    end
+end
+
+% Finalize
+disp('Done!');
+
+% Check the size of the first cell as an example
+[totalRows, totalCols] = size(combinedMeanAll{1});
+fprintf('Cell 1 combined size: %d rows x %d columns\n', totalRows, totalCols);
+
+% Optional: Save the result to a new file
+% save('CombinedResults.mat', 'combinedMeanAll');
+
+
+%% 2. Filter rsp higher than 8
+% Get the number of rows (assuming all cells have the same number of rows)
+nRows = size(combinedMeanAll{1}, 1);
+
+% Create a "Logical Mask" to track bad rows. 
+% Initially, all are false (0), meaning "Keep this row".
+rowsToDelete = false(nRows, 1);
+
+% 2. Identify Bad Rows
+fprintf('Checking %d rows across 7 cells...\n', nRows);
+
+for c = 1:7
+    currentMatrix = combinedMeanAll{c};
+    
+    % Check: Is any value in a row > 8?
+    % 'currentMatrix > 8' creates a big matrix of 1s and 0s.
+    % 'any(..., 2)' collapses columns, returning true if ANY column in that row is true.
+    badRowsInThisCell = any(currentMatrix > 8, 2);
+    
+    % Accumulate the bad rows. 
+    % The '|' (OR operator) ensures that if a row is bad in Cell 1 OR Cell 2, 
+    % it gets marked for deletion.
+    rowsToDelete = rowsToDelete | badRowsInThisCell;
+end
+
+% Report how many will be deleted
+numDeleted = sum(rowsToDelete);
+fprintf('Found %d rows containing values > 8.\n', numDeleted);
+fprintf('Remaining rows: %d\n', nRows - numDeleted);
+
+% 3. Apply Deletion
+if numDeleted > 0
+    for c = 1:7
+        % Delete the rows marked as true in 'rowsToDelete'
+        combinedMeanAll{c}(rowsToDelete, :) = [];
+    end
+    disp('Deletion complete. All cells are now synchronized.');
+else
+    disp('No values over 8 were found. No rows deleted.');
+end
+
+%% 3. avg+sem
+
+% Initialize cell arrays to hold the results
+% We keep the 1x7 cell structure to match your input data
+meanVectors = cell(1, 7);
+semVectors  = cell(1, 7);
+
+% Loop through each of the 7 cells
+for c = 1:7
+    % Extract the big Nx211 matrix for this cell
+    thisData = combinedMeanAll{c};
+    
+    % 1. Compute the Mean
+    % mean(data, 1) computes the mean down the columns (collapsing rows)
+    % Result is a 1x211 vector
+    meanVectors{c} = mean(thisData, 1);
+    
+    % 2. Compute the Standard Error of the Mean (SEM)
+    % SEM = Standard Deviation / sqrt(N)
+    % N is the number of rows (observations)
+    N = size(thisData, 1);
+    
+    % std(data, 0, 1):
+    % The '0' specifies normalizing by N-1 (standard unbiased estimator)
+    % The '1' specifies operating along the first dimension (columns)
+    stdDev = std(thisData, 0, 1);
+    
+    semVectors{c} = stdDev ./ sqrt(N);
+end
+
+% This creates a 7x211 matrix where row 1 is Cell 1's mean, etc.
+meanMatrix = vertcat(meanVectors{:});
+semMatrix = vertcat(semVectors{:});
+
+
+%% graph
+
+% x = [];
+% xCI = [];
+
+% xCI = xCI/2;
+% 
+% figure;
+% hold on;
+% 
+% % 1. Define Range
+% range_idx = 30:150; 
+% x_axis = range_idx; 
+% 
+% % 2. Define Colors
+% line_colors = [0 0.4470 0.7410; 0.8500 0.3250 0.0980]; 
+% fill_colors = [0.6 0.8 1; 1 0.7 0.6]; 
+% 
+% h_lines = gobjects(1, 2); 
+% 
+% % 3. Loop through rows
+% for i = 1:2
+%     current_x = x(i, range_idx);
+%     current_CI = xCI(i, range_idx);
+%     std_upper = current_x + current_CI;
+%     std_lower = current_x - current_CI;
+% 
+%     fill([x_axis, fliplr(x_axis)], ...
+%          [std_lower, fliplr(std_upper)], ...
+%          fill_colors(i,:), 'EdgeColor', 'none', ...
+%          'FaceAlpha', 0.4, 'HandleVisibility', 'off');
+% 
+%     h_lines(i) = plot(x_axis, current_x, 'Color', line_colors(i,:), 'LineWidth', 1.25);
+% end
+% 
+% % 4. Event markers (FIXED HEIGHT SEGMENTS)
+% % Instead of xline, we draw explicit lines from y=-0.1 to y=0.8
+% % Change [-0.1 0.8] to whatever vertical start/end points you prefer.
+% plot([60 60], [-0.05 0.85], '--r', 'LineWidth', 0.8, 'HandleVisibility', 'off');
+% plot([69 69], [-0.05 0.85], '--r', 'LineWidth', 0.8, 'HandleVisibility', 'off');
+% 
+% yline(0, 'k', 'HandleVisibility', 'off');
+% 
+% % 5. Set HARD limits
+% ylim([-0.02 0.85]); 
+% 
+% % 6. Legend & Clean up
+% % legend(h_lines, {'Before', 'After'}, 'Location', 'best', 'Box', 'off');
+% axis off; 
+% 
+% hold off;
+
+%% plot traces
+
+% x1 = []; x2 = [];
+% xCI1 = []; xCI2 = [];
+
+figure;
+hold on;
+
+% --- SETTINGS ---
+color_mode = 'green_orange'; % Options: 'red_blue' or 'green_orange'
+
+% 1. Define Range
+range_idx = 30:150; 
+x_axis = range_idx; 
+
+% 2. Define Custom Color Gradients based on mode
+if strcmp(color_mode, 'green_orange')
+    % Green Gradient: Dark Green to Light Green
+    colors_set1 = [linspace(0, 0.6, 6)', linspace(0.4, 0.9, 6)', linspace(0, 0.6, 6)'];
+    % Orange Gradient: Dark Orange to Pale Orange
+    colors_set2 = [linspace(0.8, 1, 6)', linspace(0.3, 0.8, 6)', linspace(0, 0.5, 6)'];
+else
+    % Red Gradient: Dark Red [0.5 0 0] to Light Pink/Red [1 0.7 0.7]
+    colors_set1 = [linspace(0.5, 1, 6)', linspace(0, 0.7, 6)', linspace(0, 0.7, 6)'];
+    % Blue Gradient: Dark Blue [0 0 0.5] to Light Blue [0.6 0.8 1]
+    colors_set2 = [linspace(0, 0.6, 6)', linspace(0, 0.8, 6)', linspace(0.5, 1, 6)'];
+end
+
+figure;
+hold on;
+
+% 3. Initialize Arrays for Legend Handles
+h_lines = gobjects(1, 12); 
+legend_labels = { ...
+    'Pre 0.1', 'Pre 0.3', 'Pre 0.5', 'Pre 0.7', 'Pre 0.9', 'Pre 1.1', ...
+    'Post 0.1', 'Post 0.3', 'Post 0.5', 'Post 0.7', 'Post 0.9', 'Post 1.1' ...
+};
+
+% 4. Plot Set 1 (x1)
+for i = 1:6
+    current_x = x1(i, range_idx);
+    current_CI = xCI1(i, range_idx);
+    
+    fill([x_axis, fliplr(x_axis)], [current_x - current_CI, fliplr(current_x + current_CI)], ...
+         colors_set1(i,:), 'EdgeColor', 'none', ...
+         'FaceAlpha', 0.15, 'HandleVisibility', 'off');
+         
+    h_lines(i) = plot(x_axis, current_x, 'Color', colors_set1(i,:), 'LineWidth', 1.5);
+end
+
+% 5. Plot Set 2 (x2)
+for i = 1:6
+    current_x = x2(i, range_idx);
+    current_CI = xCI2(i, range_idx);
+    
+    fill([x_axis, fliplr(x_axis)], [current_x - current_CI, fliplr(current_x + current_CI)], ...
+         colors_set2(i,:), 'EdgeColor', 'none', ...
+         'FaceAlpha', 0.15, 'HandleVisibility', 'off');
+         
+    h_lines(i+6) = plot(x_axis, current_x, 'Color', colors_set2(i,:), 'LineWidth', 1.5);
+end
+
+% 6. Event markers
+plot([60 60], [-0.05 0.85], '--k', 'LineWidth', 1.2, 'HandleVisibility', 'off');
+plot([69 69], [-0.05 0.85], '--k', 'LineWidth', 1.2, 'HandleVisibility', 'off');
+yline(0, 'k', 'HandleVisibility', 'off');
+
+% 7. LEGEND (Modified for 2 Columns)
+lgd = legend(h_lines, legend_labels, ...
+    'Location', 'northeast', ...
+    'Box', 'on', ...
+    'NumColumns', 2); % <--- SPLITS INTO 2 COLUMNS
+lgd.Color = 'w'; 
+lgd.FontSize = 18.5;     % Smaller font helps fit 2 columns nicely
+lgd.LineWidth = 1.5;
+
+title('Control - Peripheral', 'FontSize', 14);
+
+% 8. SCALE BAR (L-BAR) - MOVED DOWN AND LEFT
+% --- Settings ---
+origin_x = 30;    % Shifted left (Data starts at 30)
+origin_y = -0.05;  % Shifted down (Data sits around 0)
+len_x    = 30;    % Length of X-bar 
+len_y    = 0.2;   % Length of Y-bar
+label_x  = '1s'; 
+label_y  = '0.2 dF/F';  
+
+% --- Draw the L-Shape ---
+% Vertical line
+plot([origin_x origin_x], [origin_y, origin_y + len_y], ...
+    '-k', 'LineWidth', 2, 'HandleVisibility', 'off');
+
+% Horizontal line
+plot([origin_x, origin_x + len_x], [origin_y origin_y], ...
+    '-k', 'LineWidth', 2, 'HandleVisibility', 'off');
+
+% --- Add Labels ---
+% Y-Label: Rotated 90 degrees
+text(origin_x, origin_y + len_y/2, label_y, ...
+    'Rotation', 90, ...                % Rotates text vertically
+    'HorizontalAlignment', 'center', ... % Centers text along the bar height
+    'VerticalAlignment', 'bottom', ...   % Places text to the left of the line
+    'FontSize', 12);
+
+% X-Label: Standard horizontal
+text(origin_x + len_x/2, origin_y, [' ' label_x], ...
+    'HorizontalAlignment', 'center', ...
+    'VerticalAlignment', 'top', 'FontSize', 12);
+
+% 9. Set HARD limits
+ylim([-0.15 0.85]); 
+xlim([30 150]);     
+
+axis off; 
+hold off;
+
+%% plot background
+
+% --- SETTINGS ---
+color_mode = 'green_orange'; % Options: 'red_blue' or 'green_orange'
+row_to_plot = 1;             % Which condition (0.1, 0.3, etc.) to visualize
+
+% 1. Define Colors based on mode
+if strcmp(color_mode, 'red_blue')
+    c1 = [0.85, 0.33, 0.10]; % Red (Matlab-style)
+    c2 = [0, 0.45, 0.74];    % Blue
+else
+    % Using high-contrast versions of your preferred green/orange
+    c1 = [0, 0.5, 0];        % Strong Green
+    c2 = [0.9, 0.4, 0];      % Vibrant Orange
+end
+
+figure; hold on;
+range_idx = 30:150;
+x_axis = range_idx;
+
+% 2. Plot Dataset 1 (x1) - Using row_to_plot
+current_x1 = x1(row_to_plot, range_idx);
+current_CI1 = xCI1(row_to_plot, range_idx);
+
+fill([x_axis, fliplr(x_axis)], [current_x1 - current_CI1, fliplr(current_x1 + current_CI1)], ...
+     c1, 'EdgeColor', 'none', 'FaceAlpha', 0.2, 'HandleVisibility', 'off');
+h1 = plot(x_axis, current_x1, 'Color', c1, 'LineWidth', 2);
+
+% 3. Plot Dataset 2 (x2) - Using row_to_plot
+current_x2 = x2(row_to_plot, range_idx);
+current_CI2 = xCI2(row_to_plot, range_idx);
+
+fill([x_axis, fliplr(x_axis)], [current_x2 - current_CI2, fliplr(current_x2 + current_CI2)], ...
+     c2, 'EdgeColor', 'none', 'FaceAlpha', 0.2, 'HandleVisibility', 'off');
+h2 = plot(x_axis, current_x2, 'Color', c2, 'LineWidth', 2);
+
+% 4. Elements
+yline(0, 'k', 'HandleVisibility', 'off');
+% Vertical markers
+plot([60 60], [-0.06 0.85], '--k', 'LineWidth', 1.2, 'HandleVisibility', 'off');
+plot([69 69], [-0.06 0.85], '--k', 'LineWidth', 1.2, 'HandleVisibility', 'off');
+
+% 5. Legend with thick border
+lgd = legend([h1, h2], {'Pre Background', 'Post Background'}, 'Location', 'northeast');
+lgd.Box = 'on';
+lgd.LineWidth = 1.5; 
+lgd.FontSize = 18.5;
+
+% 7. SCALE BAR (L-BAR)
+% --- Settings ---
+origin_x = 30;    % Shifted left (Data starts at 30)
+origin_y = -0.06;  % Shifted down (Data sits around 0)
+len_x    = 30;    % Length of X-bar 
+len_y    = 0.2;   % Length of Y-bar
+label_x  = '1s'; 
+label_y  = '0.2 dF/F';  
+
+
+% --- Draw the L-Shape ---
+% Vertical line
+plot([origin_x origin_x], [origin_y, origin_y + len_y], ...
+    '-k', 'LineWidth', 2, 'HandleVisibility', 'off');
+
+% Horizontal line
+plot([origin_x, origin_x + len_x], [origin_y origin_y], ...
+    '-k', 'LineWidth', 2, 'HandleVisibility', 'off');
+
+% % --- Add Labels ---
+% % Y-Label: Rotated 90 degrees
+% text(origin_x, 0, label_y, ...
+%     'Rotation', 90, ...      
+%     'HorizontalAlignment', 'center', ... 
+%     'VerticalAlignment', 'bottom', ...      % <--- CHANGED: Pushes text to the left of the line
+%     'FontSize', 12);
+% 
+% % X-Label: Standard horizontal
+% text(origin_x + len_x/2, origin_y, [' ' label_x], ...
+%     'HorizontalAlignment', 'center', ...
+%     'VerticalAlignment', 'top', 'FontSize', 12);
+
+% 7. Final Cleanup
+ylim([-0.06 0.04]); 
+xlim([30 150]);     
+   
+axis off; 
+hold off;
+
+
+%% Save all open fig as png
+FolderName = ('/Users/katiepham/Desktop/');   % using my directory
+FigList = findobj(allchild(0), 'flat', 'Type', 'figure');
+for iFig = 1:length(FigList)
+  FigHandle = FigList(iFig);
+  FigName   = num2str(get(FigHandle, 'Number'));
+  set(0, 'CurrentFigure', FigHandle);
+%   saveas(FigHandle, strcat(FigName, '.png'));
+  saveas(FigHandle, fullfile(FolderName,strcat(FigName, '.mat'))); % specify the full path
+end

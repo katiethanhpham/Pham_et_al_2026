@@ -1,0 +1,132 @@
+%Generate seq of 70 numbers from 0 to 6, each repeat 15 times, with 0 at start
+% numbers = repmat(0:6, 1, 10);
+% shuffled_numbers = numbers(randperm(length(numbers) - 1) + 1);
+% sequence = [0 shuffled_numbers];
+
+sequence = [0	1	4	5	1	0	6	0	5	3	2	1	3	6	2	4	6	4	6	0	2	3	6	1	4	6	2	3	2	1	1	3	1	5	5	0	5	4	5	2	4	3	2	5	2	2	4	1	6	1	0	4	5	4	6	3	3	0	0	0	5	6	5	3	6	0	2	1	4	3];
+
+ISI=4.7; %interstimulus interval in seconds
+sca
+
+tf=0; %temporal and spatial frequency of the stimuli. 
+sf=0.1:0.2:1.1;
+% These are reasonable values based on this: https://www.nature.com/articles/s41593-019-0550-9/figures/3 
+duration=0.3; %stimulus duration in s. 
+screendist=300; %distance to the screen in mm
+
+maxlum=0.2;  %mximum relative luminance
+meanlum=0.1; %mean relative luminance
+
+meanpix=round(relative2pix_Katie(meanlum));
+
+Screen('Preference', 'SkipSyncTests', 1);
+window=Screen('OpenWindow',0,0,[],[],2); %2 is for buffer size 2, not sure if necessary to set it
+
+[Dispwidth, Dispheight]=Screen('DisplaySize', window);  
+[Winwidth, Winheight]=Screen('WindowSize', window); %resolution in pixels
+
+backgroundTex=Screen('MakeTexture',window,uint8(meanpix*ones(Winheight,Winwidth))); %conversion to uint8 proably not necessary...
+
+
+Screen('DrawTexture',window,backgroundTex); 
+Screen('DrawText',window,'initializing stimuli, this takes about 20s',200,Winheight-20,0);
+Screen('Flip',window);
+HideCursor();
+
+angles=90; %the 12 stimulus angles
+
+
+stimtex=[];
+for i=1:length(sf)
+    stim=mvSinGrat_create(angles,tf,sf(i),duration,screendist);
+    stim=maxlum*stim; %rescale luminance values (to make dimmer)
+    stim=uint8(relative2pix_Katie(stim));
+    for j=1:size(stim,3)
+        stimtex(i,j)=Screen('MakeTexture',window,stim(:,:,j)); 
+    end
+end
+stimtex(13,:)=backgroundTex;
+
+maptex=[stimtex(1,:) stimtex(10,:)]; %mapping texture is just composite of right moving and down moving stimuli
+maptex(2,:)=backgroundTex; %control stimulus
+
+trigger_rect = [0 Winheight-40 40 Winheight];
+
+%Nasal:
+NX1 = 0
+NX2 = 285.88
+
+%Peri:
+% NX1 = 1634.1
+% NX2 = 1920
+    
+status=1;
+while status>0
+    
+    Screen('DrawTexture',window,backgroundTex);
+    Screen('DrawText',window,' L click=mvsg12, R click= responsecheck, M=exit',200,Winheight-20,0);
+    Screen('FillRect',window,0,trigger_rect);
+    Screen('Flip',window);
+    
+    %only advance program after button press
+    button=0;
+    while ~any(button)
+        [x y button]=GetMouse(); %wait for button press
+    end
+    if button(1)
+        status=2; %moving grating stimulus
+        seq=sequence;
+        tex=stimtex;
+    elseif button(2)
+        status=0; %exit program
+    else
+        status=1; %mapping stimulus
+        seq=mapsequence;
+        tex=maptex;
+    end
+    while any(button)
+        [x y button]=GetMouse(); %wait for release
+    end
+    
+    if status>0
+        for stimin=1:length(seq)
+            Screen('DrawTexture',window,backgroundTex);
+            Screen('FillRect',window,0,trigger_rect);
+            Screen('Flip',window);
+            tic;
+            while toc<ISI
+                [mX, mY, buttons] = GetMouse;
+                if buttons(2)
+                    while any(buttons)
+                        [mX, mY, buttons] = GetMouse; %wait for button release
+                    end
+                    status=-1;
+                    break; %this just gets me out of this ISI while loop
+                end
+            end
+            if status==-1
+                status=1;
+                break; %break out of the stimulus for loop
+            end
+            
+            id=seq(stimin);
+            id(id==0)=size(tex,1); %final texture row is the control blank stimulus
+
+            for i=1:size(tex,2)    
+                Screen('DrawTexture',window, backgroundTex);
+                Screen('DrawTexture',window,tex(id,i),[NX1 0 NX2 1080],[NX1 0 NX2 1080]);
+                Screen('FillRect',window,(i<6)*255,trigger_rect); %show trigger during first 5 frames of the stimulus
+                Screen('Flip',window);             
+            end
+            
+            
+        end
+        
+    end
+    
+end
+
+Screen('Close',stimtex(:));
+Screen('CloseAll');
+ShowCursor();
+    

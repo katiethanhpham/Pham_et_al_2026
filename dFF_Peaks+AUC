@@ -1,0 +1,86 @@
+clear; clc;
+% --- CONFIGURATION ---
+folderPath = uigetdir(pwd, 'Select the folder containing .mat files');
+if folderPath == 0, error('User cancelled folder selection.'); end
+
+analysisWindow = 61:151; %change dff window: 60fr for acuity, 90fr for contrast
+thresholdVal = 8;       
+% ---------------------
+
+fileList = dir(fullfile(folderPath, '*.mat'));
+if isempty(fileList), error('No .mat files found.'); end
+
+% --- NEW: Tracking Variables ---
+combinedMeanAll = cell(1, 7);
+sourceFileIDs = []; % Stores the index (k) for every row
+
+fprintf('Found %d files. Starting aggregation...\n', length(fileList));
+
+for k = 1:length(fileList)
+    thisFileName = fullfile(fileList(k).folder, fileList(k).name);
+    loadedData = load(thisFileName);
+    
+    if isfield(loadedData, 'Results') && isfield(loadedData.Results, 'meanAll')
+        currentMeanAll = loadedData.Results.meanAll;
+        numTrialsInFile = size(currentMeanAll{1}, 1);
+        
+        % 1. Stack the Data
+        for c = 1:7
+            combinedMeanAll{c} = [combinedMeanAll{c}; currentMeanAll{c}];
+        end
+        
+        % 2. NEW: Track the source of these specific rows
+        % We repeat the current file index 'k' for every trial found in this file
+        sourceFileIDs = [sourceFileIDs; repmat(k, numTrialsInFile, 1)];
+        
+    else
+        warning('File %s is missing "Results.meanAll". Skipped.', fileList(k).name);
+    end
+end
+
+[totalRows, ~] = size(combinedMeanAll{1});
+
+% --- 2. Data Cleaning (Artifact Rejection) ---
+rowsToDelete = false(totalRows, 1); 
+for c = 1:7
+    rowsToDelete = rowsToDelete | any(combinedMeanAll{c} > thresholdVal, 2);
+end
+
+numDeleted = sum(rowsToDelete);
+if numDeleted > 0
+    for c = 1:7
+        combinedMeanAll{c}(rowsToDelete, :) = [];
+    end
+    % NEW: Keep the source IDs in sync with the deleted data rows
+    sourceFileIDs(rowsToDelete) = []; 
+    fprintf('Deleted %d rows. Remaining: %d\n', numDeleted, size(combinedMeanAll{1}, 1));
+end
+
+% --- 3. Analysis (Peaks and AUC) ---
+% (Logic remains the same as your original script)
+peakValuesAll = cell(1, 7);
+aucValuesAll  = cell(1, 7);
+for c = 1:7
+    dataSlice = combinedMeanAll{c}(:, analysisWindow);
+    peakValuesAll{c} = max(dataSlice, [], 2);
+    aucValuesAll{c}  = trapz(dataSlice, 2);
+end
+
+% --- 4. Final Organization & Mapping ---
+peakMatrix = [peakValuesAll{:}];
+aucMatrix  = [aucValuesAll{:}];
+
+% NEW: Create a cell array of strings showing the actual filename for every row
+% This makes the numeric sourceFileIDs human-readable
+sourceFileMapping = {fileList(sourceFileIDs).name}';
+
+% Create a Table for easy viewing
+ResultsTable = table(sourceFileMapping, peakMatrix, aucMatrix, ...
+    'VariableNames', {'Original_File', 'Peaks_Cond_1to7', 'AUC_Cond_1to7'});
+
+fprintf('\nAnalysis complete. You can now inspect "ResultsTable" to see file origins.\n');
+
+% % --- 5. Save ---
+% saveFileName = fullfile(folderPath, 'CombinedAnalysis_Results.mat');
+% save(saveFileName, 'combinedMeanAll', 'peakMatrix', 'aucMatrix', 'sourceFileMapping', 'ResultsTable');
+% disp('Results and Source Mapping saved.');

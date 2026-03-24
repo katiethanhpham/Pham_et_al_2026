@@ -1,0 +1,366 @@
+% =========================================================================
+% MASTER PIPELINE: Batch Analysis for ContrastNeuralAnalyzed
+% =========================================================================
+
+% 1. Setup Root Folder
+folderPath = uigetdir(pwd, 'Select the ContrastNeuralAnalyzed Master Folder');
+if folderPath == 0; return; end
+
+% Find all Fall.mat files recursively
+allFiles = dir(fullfile(folderPath, '**', 'Fall.mat'));
+
+% --- STRICT FILTER: Keep only r1, r3, r11 ---
+keepMask = false(length(allFiles), 1);
+for i = 1:length(allFiles)
+    parts = split(allFiles(i).folder, filesep);
+    idx = find(strcmp(parts, 'suite2p'), 1, 'last'); 
+    if ~isempty(idx) && idx > 1
+        recID = parts{idx-1}; 
+        if ismember(recID, {'r1', 'r3', 'r11'})
+            keepMask(i) = true;
+        end
+    end
+end
+files = allFiles(keepMask); 
+nFiles = length(files);
+
+if nFiles == 0
+    error('No Fall.mat files found matching folders r1, r3, or r11.');
+end
+
+fprintf('Targeted Filter Applied. Found %d valid recordings. Starting Pipeline...\n', nFiles);
+
+% 2. Define Hardcoded Stimulus Parameters
+SFs_TEMPLATE = [0 1 4 5 1 0 6 0 5 3 2 1 3 6 2 4 6 4 6 0 2 3 6 1 4 6 2 3 2 1 1 3 1 5 5 0 ...
+                5 4 5 2 4 3 2 5 2 2 4 1 6 1 0 4 5 4 6 3 3 0 0 0 5 6 5 3 6 0 2 1 4 3];
+SFs_TEMPLATE = SFs_TEMPLATE(2:end); 
+stimuli = unique(SFs_TEMPLATE);
+
+% *** ADDED STIMULUS 6 HERE ***
+target_stimuli = [2, 3, 4, 5, 6];
+
+% 3. Main Loop Over Each Recording
+for f = 1:nFiles
+    try
+        currentFile = fullfile(files(f).folder, files(f).name);
+        savePath = fullfile(files(f).folder, 'DECODING_RESULTS_BATCH_NEW2.mat'); 
+        
+        parts = split(files(f).folder, filesep);
+        idx = find(strcmp(parts, 'suite2p'), 1, 'last');
+        currentRecID = parts{idx-1};
+        
+        fprintf('Processing %d/%d: [%s] ...%s\n', f, nFiles, currentRecID, files(f).folder(end-20:end));
+        
+        raw = load(currentFile); 
+        if ~isfield(raw, 'F') || ~isfield(raw, 'ops'), continue; end
+        
+        tiffLengths = raw.ops.frames_per_file;
+        tiffLengths = tiffLengths(tiffLengths >= 10);
+        onsets = cumsum([1 tiffLengths]);
+        if numel(onsets) > 2, onsets = onsets(2:end-1); end
+        
+        if length(onsets) ~= length(SFs_TEMPLATE), continue; end
+        
+        compute_dff = @(Fcorr, ons) arrayfun(@(o) ...
+            (Fcorr(o-60:o+150) - mean(Fcorr(o-30:o-1))) / mean(Fcorr(o-30:o-1)), ...
+            ons, 'UniformOutput', false);
+
+        nROIs = size(raw.F, 1);
+        Presponse = nan(length(stimuli), nROIs);
+        meanResp = nan(length(stimuli), nROIs);
+        
+        for roiin = 1:nROIs
+            Fcorr = raw.F(roiin,:) - 0.7 * raw.Fneu(roiin,:);
+            traces = cell2mat(compute_dff(Fcorr, onsets)');
+            
+            % Window 61 to 151
+            Rcontrol = mean(traces(SFs_TEMPLATE == 0, 61:151), 2);
+            for s_idx = 1:length(stimuli)
+                stim = stimuli(s_idx);
+                if stim == 0, continue; end
+                Rstim = mean(traces(SFs_TEMPLATE == stim, 61:151), 2);
+                
+                [p, ~] = ranksum(Rstim, Rcontrol, "Tail","right");
+                Presponse(s_idx, roiin) = p;
+                meanResp(s_idx, roiin) = mean(Rstim);
+            end
+        end
+        
+        isResponsive = any(Presponse(2:end,:) < 0.05/6);
+        isBig = any(meanResp(2:end,:) > 0.15);
+        includedROIs = find(isResponsive & isBig);
+        
+        if isempty(includedROIs), continue; end
+        
+        BatchResults = struct(); 
+        tempWorkDir = fullfile(files(f).folder, 'NDT_Temp_Processing');
+        if ~exist(tempWorkDir, 'dir'), mkdir(tempWorkDir); end
+        
+        for t = 1:length(target_stimuli)
+            currentStim = target_stimuli(t);
+            comparisonName = sprintf('Stim0_vs_%d', currentStim);
+            
+            rasterFolder = fullfile(tempWorkDir, ['Raster_' comparisonName]);
+            if ~exist(rasterFolder, 'dir'), mkdir(rasterFolder); end
+            
+            validIdx = find(SFs_TEMPLATE == 0 | SFs_TEMPLATE == currentStim);
+            validLbl = SFs_TEMPLATE(validIdx);
+            
+            for i = 1:length(includedROIs)
+                roiin = includedROIs(i);
+                Fcorr = raw.F(roiin,:) - 0.7 * raw.Fneu(roiin,:);
+                traces = cell2mat(compute_dff(Fcorr, onsets)');
+                
+                raster_data = traces(validIdx, :);
+                labelList = strings(length(validLbl), 1);
+                labelList(validLbl == 0) = "Background";
+                labelList(validLbl == currentStim) = "Stimulus";
+                
+                raster_labels.stimulus_ID = cellstr(labelList);
+                raster_site_info.recording_channel = roiin;
+                raster_site_info.is_included = 1;
+                
+                save(fullfile(rasterFolder, sprintf('site_%03d.mat', roiin)), ...
+                    'raster_data', 'raster_labels', 'raster_site_info');
+            end
+            
+            binnedFilePrefix = fullfile(tempWorkDir, ['Binned_' comparisonName]);
+            actualBinnedFileName = create_binned_data_from_raster_data(rasterFolder, binnedFilePrefix, 5, 2);
+            
+            ds = basic_DS(actualBinnedFileName, 'stimulus_ID', 5);
+            cl = max_correlation_coefficient_CL;
+            fps = {zscore_normalize_FP};
+            cv = standard_resample_CV(ds, cl, fps);
+            cv.num_resample_runs = 50; 
+            
+            DECODING_OUT = cv.run_cv_decoding;
+            mean_acc = diag(DECODING_OUT.ZERO_ONE_LOSS_RESULTS.mean_decoding_results) * 100;
+            time_axis = -60 + (0:(length(mean_acc)-1)) * 2 + 2.5;
+            mask = time_axis >= 0 & time_axis <= 30;
+            
+            BatchResults.(comparisonName).Peak_Accuracy = max(mean_acc(mask));
+            BatchResults.(comparisonName).AUC_Above_Chance = trapz(time_axis(mask), max(0, mean_acc(mask) - 50));
+            BatchResults.(comparisonName).Full_Trace_Mean = mean_acc;
+            BatchResults.(comparisonName).Full_Results = DECODING_OUT; 
+        end
+        
+        save(savePath, 'BatchResults', 'includedROIs');
+        rmdir(tempWorkDir, 's');
+        
+    catch ME
+        fprintf('  X ERROR processing %s: %s\n', files(f).name, ME.message);
+        if exist('tempWorkDir', 'var') && exist(tempWorkDir, 'dir'), rmdir(tempWorkDir, 's'); end
+    end
+end
+disp('Batch Processing Complete.');
+
+%% 
+% =========================================================================
+% QUICK UPDATER: Recalculate Peak and AUC for a 3-Second Window
+% =========================================================================
+disp('--- Starting 3-Second Window Update ---');
+
+% 1. Setup
+folderPath = uigetdir(pwd, 'Select the ContrastNeuralAnalyzed Master Folder');
+if folderPath == 0; return; end
+
+allResultFiles = dir(fullfile(folderPath, '**', 'DECODING_RESULTS_BATCH_NEW2.mat'));
+
+% Filter for r1, r3, r11
+keepMask = false(length(allResultFiles), 1);
+for i = 1:length(allResultFiles)
+    parts = split(allResultFiles(i).folder, filesep);
+    idx = find(strcmp(parts, 'suite2p'), 1, 'last');
+    if ~isempty(idx) && idx > 1
+        recID = parts{idx-1};
+        if ismember(recID, {'r1', 'r3', 'r11'})
+            keepMask(i) = true;
+        end
+    end
+end
+resultFiles = allResultFiles(keepMask);
+nFiles = length(resultFiles);
+
+if nFiles == 0, error('No matching files found.'); end
+fprintf('Found %d files. Recalculating metrics...\n', nFiles);
+
+stim_conditions = {'Stim0_vs_2', 'Stim0_vs_3', 'Stim0_vs_4', 'Stim0_vs_5', 'Stim0_vs_6'};
+
+% 2. Update Loop
+for i = 1:nFiles
+    filePath = fullfile(resultFiles(i).folder, resultFiles(i).name);
+    
+    try
+        % Load existing data
+        data = load(filePath);
+        BatchResults = data.BatchResults;
+        
+        for k = 1:length(stim_conditions)
+            stimName = stim_conditions{k};
+            
+            if isfield(BatchResults, stimName)
+                % Pull the full accuracy trace that is already saved!
+                mean_acc = BatchResults.(stimName).Full_Trace_Mean;
+                
+                % Recreate the time axis
+                time_axis = -60 + (0:(length(mean_acc)-1)) * 2 + 2.5;
+                
+                % *** THE MAGIC FIX: Change 30 to 90 (1 second to 3 seconds) ***
+                mask = time_axis >= 0 & time_axis <= 90;
+                
+                % Overwrite the old Peak and AUC with the newly calculated ones
+                BatchResults.(stimName).Peak_Accuracy = max(mean_acc(mask));
+                BatchResults.(stimName).AUC_Above_Chance = trapz(time_axis(mask), max(0, mean_acc(mask) - 50));
+            end
+        end
+        
+        % Save the updated struct back into the exact same file
+        % (We include 'includedROIs' if it exists so we don't accidentally delete it)
+        if isfield(data, 'includedROIs')
+            includedROIs = data.includedROIs;
+            save(filePath, 'BatchResults', 'includedROIs');
+        else
+            save(filePath, 'BatchResults');
+        end
+        
+        fprintf('Updated file %d/%d\n', i, nFiles);
+        
+    catch ME
+        warning('Failed to update %s: %s', resultFiles(i).name, ME.message);
+    end
+end
+
+disp('All files successfully updated to a 3-second window!');
+
+%% =========================================================================
+% BATCH AGGREGATOR: Compile Decoding Results
+% =========================================================================
+disp('--- Starting Aggregation Phase ---');
+
+% 1. Setup Root Folder
+folderPath = uigetdir(pwd, 'Select the ContrastNeuralAnalyzed Master Folder');
+if folderPath == 0; return; end
+
+allResultFiles = dir(fullfile(folderPath, '**', 'DECODING_RESULTS_BATCH_NEW2.mat'));
+
+keepMaskCSV = false(length(allResultFiles), 1);
+for i = 1:length(allResultFiles)
+    parts = split(allResultFiles(i).folder, filesep);
+    idx = find(strcmp(parts, 'suite2p'), 1, 'last');
+    if ~isempty(idx) && idx > 1
+        recID = parts{idx-1};
+        if ismember(recID, {'r1', 'r3', 'r11'})
+            keepMaskCSV(i) = true;
+        end
+    end
+end
+resultFiles = allResultFiles(keepMaskCSV);
+nFiles = length(resultFiles);
+
+if nFiles == 0, error('No results found for r1, r3, or r11.'); end
+fprintf('Found %d targeted result files for CSV.\n', nFiles);
+
+FileNames = strings(nFiles, 1); Dates_MouseID = strings(nFiles, 1); Recordings = strings(nFiles, 1);
+Stim2_Peak = zeros(nFiles, 1); Stim2_AUC = zeros(nFiles, 1);
+Stim3_Peak = zeros(nFiles, 1); Stim3_AUC = zeros(nFiles, 1);
+Stim4_Peak = zeros(nFiles, 1); Stim4_AUC = zeros(nFiles, 1);
+Stim5_Peak = zeros(nFiles, 1); Stim5_AUC = zeros(nFiles, 1);
+
+% *** ADDED STIMULUS 6 INITIALIZATION HERE ***
+Stim6_Peak = zeros(nFiles, 1); Stim6_AUC = zeros(nFiles, 1);
+
+for i = 1:nFiles
+    try
+        data = load(fullfile(resultFiles(i).folder, resultFiles(i).name), 'BatchResults');
+        results = data.BatchResults;
+        
+        parts = split(resultFiles(i).folder, filesep);
+        idx = find(strcmp(parts, 'suite2p'), 1, 'last');
+        recID = parts{idx-1}; dateID = parts{idx-2};
+        
+        FileNames(i) = string(resultFiles(i).folder);
+        Dates_MouseID(i) = string(dateID); Recordings(i) = string(recID);
+        
+        if isfield(results, 'Stim0_vs_2'), Stim2_Peak(i) = results.Stim0_vs_2.Peak_Accuracy; Stim2_AUC(i) = results.Stim0_vs_2.AUC_Above_Chance; end
+        if isfield(results, 'Stim0_vs_3'), Stim3_Peak(i) = results.Stim0_vs_3.Peak_Accuracy; Stim3_AUC(i) = results.Stim0_vs_3.AUC_Above_Chance; end
+        if isfield(results, 'Stim0_vs_4'), Stim4_Peak(i) = results.Stim0_vs_4.Peak_Accuracy; Stim4_AUC(i) = results.Stim0_vs_4.AUC_Above_Chance; end
+        if isfield(results, 'Stim0_vs_5'), Stim5_Peak(i) = results.Stim0_vs_5.Peak_Accuracy; Stim5_AUC(i) = results.Stim0_vs_5.AUC_Above_Chance; end
+        
+        % *** ADDED STIMULUS 6 EXTRACTION HERE ***
+        if isfield(results, 'Stim0_vs_6'), Stim6_Peak(i) = results.Stim0_vs_6.Peak_Accuracy; Stim6_AUC(i) = results.Stim0_vs_6.AUC_Above_Chance; end
+        
+    catch ME
+        warning('Error reading file %d: %s', i, ME.message);
+    end
+end
+
+% *** ADDED STIMULUS 6 TO TABLE GENERATION HERE ***
+MasterTable = table(Dates_MouseID, Recordings, ...
+    Stim2_Peak, Stim2_AUC, Stim3_Peak, Stim3_AUC, ...
+    Stim4_Peak, Stim4_AUC, Stim5_Peak, Stim5_AUC, ...
+    Stim6_Peak, Stim6_AUC, ...
+    'VariableNames', {'Dataset_ID', 'Recording', ...
+    'Stim2_Peak', 'Stim2_AUC', 'Stim3_Peak', 'Stim3_AUC', ...
+    'Stim4_Peak', 'Stim4_AUC', 'Stim5_Peak', 'Stim5_AUC', ...
+    'Stim6_Peak', 'Stim6_AUC'});
+
+saveName = fullfile(folderPath, 'Master_Decoding_Summary.csv');
+writetable(MasterTable, saveName);
+disp('Master summary CSV saved.');
+
+%% =========================================================================
+% LABELING DECODED DATA (Time-Series Formatting)
+% =========================================================================
+disp('--- Starting Time-Series Extraction ---');
+
+extractedData = struct('label', {}, 'trace', {});
+data_idx = 1;
+
+% *** ADDED STIMULUS 6 TO CONDITIONS LIST HERE ***
+stim_conditions = {'Stim0_vs_2', 'Stim0_vs_3', 'Stim0_vs_4', 'Stim0_vs_5', 'Stim0_vs_6'};
+
+for i = 1:nFiles 
+    filePath = fullfile(resultFiles(i).folder, resultFiles(i).name);
+    
+    parts = split(resultFiles(i).folder, filesep);
+    idx = find(strcmp(parts, 'suite2p'), 1, 'last');
+    recID = parts{idx-1}; 
+    expName = parts{idx-2}; 
+    
+    try
+        data = load(filePath, 'BatchResults');
+        if isfield(data, 'BatchResults')
+            for k = 1:length(stim_conditions)
+                stimName = stim_conditions{k};
+                
+                if isfield(data.BatchResults, stimName) && isfield(data.BatchResults.(stimName), 'Full_Results')
+                    
+                    mean_dec_res = data.BatchResults.(stimName).Full_Results.ZERO_ONE_LOSS_RESULTS.mean_decoding_results;
+                    diag_acc = diag(mean_dec_res) * 100;
+                    
+                    traceLabel = sprintf('%s_%s_%s', expName, recID, stimName);
+                    
+                    extractedData(data_idx).label = traceLabel;
+                    extractedData(data_idx).trace = diag_acc;
+                    data_idx = data_idx + 1;
+                end
+            end
+        end
+    catch ME
+        warning('Error extracting trace from %s: %s', filePath, ME.message);
+    end
+end
+
+if ~isempty(extractedData)
+    N = length(extractedData);
+    trace_length = length(extractedData(1).trace); 
+    finalDataMatrix = cell(N, 1 + trace_length);
+    
+    for i = 1:N
+        finalDataMatrix{i, 1} = extractedData(i).label;
+        finalDataMatrix(i, 2:end) = num2cell(extractedData(i).trace(:)');
+    end
+    fprintf('Success! Formatted %d traces into a %dx%d cell array.\n', N, size(finalDataMatrix, 1), size(finalDataMatrix, 2));
+else
+    warning('No valid traces were extracted.');
+end

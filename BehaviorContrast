@@ -1,0 +1,235 @@
+%Visual stimulation program for crossmodal project behavioral task
+%A moving sinusoidal grating either in periphery or in nasal
+%visual field. Fixed spatial frequency 
+
+%Instead of using a fixed stimulus sequence, the stimuli are requested via tcpip
+
+%stimulus requests are 2 bytes: first is a number 1 to 3 1=nasal position
+%2=peripheral position 3=full screen
+%second byte is the desired contrast level, my thinking is to do 
+% contrast=2^y for (2%,4%,8%,16%,32% ...) but let's see. 
+
+%NOTE! This program is calibrated to work with screen brightness turned to
+%100! ->changed this late march 2025, now it works with brightness=0%
+
+Screen('Preference', 'SkipSyncTests', 1); %dunno why im getting sync failure on this screen....
+
+%config 
+contrasts=[0.005 0.01 0.02 0.04 0.08 0.16 0.32 0.64 0.9]; %spatial frequency of the stimuli
+    %stimulus #7 is the easiest stimulus. The highest displayable contrast
+    %depends on luminance level but it's always below 1 because the screen
+    %can't display true black
+
+meanrel=0.5; %mean luminance as a fraction of maximum luminance. 0.15 means the mean luminance is 15% of max luminance
+    %This screen should have max luminance of ~350cd/m2 if it's set to
+    %max.It's about 13.4% of this value at brightness=0, so at meanrel 0.5
+    %
+    %the luminance is estimated to be 23.5cd/m2. 
+   %The original run had meanrel=0.1 with screen brightness set to max 
+   
+stimduration=1; 
+spatial_frequency=0.05; %cpd 0.05
+temporal_frequency=2; %Hz !the gray background calculation assumes this is 2Hz (though it could also be 4..),
+    %change to 1 or 3 would require some small modifications of the background texture calculation
+    %The same calculation also assumes the frame rate is 144Hz and
+    %resolution 1920x1080
+
+stimangle=40; %angle at which the stimulus size is determined. The stimulus is displayed at 35 to 45 degrees relative to 
+    %center of the screen but the size is calculated at midpoint which is 40 degrees off center 
+
+Distance=236; %Distance to the center of the screen in mm. 
+% Based on the holy triangle that was originally based on dimensions of a different PC screen...
+
+
+window=Screen('OpenWindow',0,0,[],[],2);%2 is for buffer size 2, not sure if necessary to set it
+
+[Dispwidth, Dispheight]=Screen('DisplaySize', window);  %should be height/width of display in mm. Verify and override if wrong.  
+    %18.75 inches->476mm, agrees with returned value
+
+[Winwidth, Winheight]=Screen('WindowSize', window); %resolution in pixels
+
+blackTex=Screen('MakeTexture',window,uint8(zeros(Winheight,Winwidth))); %conversion to uint8 proably not necessary...
+
+
+Screen('DrawTexture',window,blackTex); %during stimulus initialization show black screen
+Screen('Flip',window);
+HideCursor();
+
+centerpix=round((Winwidth+1)/2);
+pixpermm=Winwidth/Dispwidth;
+
+
+background_gray=zeros(Winheight,Winwidth)+relative2pix_Lukas(meanrel); %this is temporary background, for actual stimuli I'll 
+    %use a scrambled stimulus as background since it's more accurate. 
+
+backgroundTex_gray=Screen('MakeTexture',window,uint8(background_gray));
+
+guidelinePix=round(tand(35)*Distance*pixpermm); %guideline position (pixels from center)
+stimEdgePix=round(tand(45)*Distance*pixpermm);
+%the temporal guideline should be at 90degree azimuth (and nasal guideline is
+%at 20 degree azimuth). This is also distance to the stimulus edge. 
+guidelineScreen=background_gray;
+guidelineScreen(:,centerpix-guidelinePix-4:centerpix-guidelinePix+4)=0;
+guidelineScreen(:,centerpix+guidelinePix-4:centerpix+guidelinePix+4)=0;
+
+%convert to texture and display
+guidelineTex=Screen('MakeTexture',window,uint8(guidelineScreen));
+
+
+%instead of creating different stimuli using different masks, I create only
+%1 set of stimuli and show background texture over the area I want to
+%mask. I have 3 different mask rectangles to do this
+
+maskrect=[];
+maskrect(1,:)=[centerpix-guidelinePix 1 1920 1080]; %cover peripheral stim
+maskrect(2,:)=[1 1 centerpix+guidelinePix 1080]; %cover nasal stim
+maskrect(3,:)=[1 1 2 2]; %dummy rect to do nothing (show full stimulus)
+
+
+prev=background_gray; %preview screen with all stimuli
+spacing=Winwidth/length(contrasts); %spacing of stimuli on preview screen
+
+
+Distance_stim=Distance/cosd(stimangle); %distance to the stimulus
+
+clear STIMULI;
+for coni=1:length(contrasts)
+
+    Screen('DrawTexture',window,blackTex); %during stimulus initialization show black screen
+    Screen('DrawText',window,['generating stimulus #' num2str(coni) ' / ' num2str(length(contrasts)) ' (takes about 3 minutes)'],100,Winheight-20,70);
+    Screen('Flip',window);
+
+    stim=mvSinGrat_contrastTask(temporal_frequency,spatial_frequency,contrasts(coni),meanrel,stimduration,Distance_stim);
+    stim=uint8(stim); 
+    STIMULI{coni}=stim; %store stimulus for further processing (application of mask and conversion to texture)
+
+    %make the preview stimulus that displays all the stimuli side by side
+    A=stim(:,:,1);
+    xfrom=round((coni-1)*spacing)+1;
+    xto=round(coni*spacing);
+    prev(1:800,xfrom:xto)=A(1:800,1:(xto-xfrom)+1);
+
+end
+
+Screen('DrawTexture',window,blackTex); %during stimulus initialization show black screen
+Screen('DrawText',window,'creating stimulus textures',100,Winheight-20,70);
+Screen('Flip',window);
+
+
+%create stimulus-scramble background (should better match stim luminance)
+stim=STIMULI{1}; %using the third 8% stimulus for this purpose
+substim=stim(1:15,:,1:72); %to create background texture, I could use stim(:,:,1) but since the number of oscilations per
+    %screen height is not guaranteed to be an integer I'll rather use time
+    %pixels sampled over 0.5 seconds (luminances go over all values). 15*72=1080
+substim=substim(:);
+substim=randsample(substim,length(substim));
+substim=reshape(substim,[1080 1920]);  
+background_mix=substim;
+prev(728:end,:)=background_mix(728:end,:); %801; changed to 728 to be in the middle of the phase 
+backgroundTex_mix=Screen('MakeTexture',window,background_mix);
+
+%I'm going to make just one set of stimuli shown from -45 to +45 dg of the
+%screen. Then I'll either show the whole stimulus ('fullscreen mode') or
+%cover the the side that's not supposed to be shown. 
+
+stimtex=[];
+for stimi=1:length(STIMULI)
+    stim=STIMULI{stimi};
+    for fri=1:size(stim,3)
+        frame=background_mix;
+        frame(:,centerpix-stimEdgePix:centerpix+stimEdgePix)=stim(:,centerpix-stimEdgePix:centerpix+stimEdgePix,fri);
+        stimtex(stimi,fri)=Screen('MakeTexture',window,frame);
+    end
+end
+
+
+
+previewTex=Screen('MakeTexture',window,prev);
+Screen('DrawTexture',window,previewTex); %show preview texture
+Screen('DrawText',window,'waiting for TCPIP connection...',10,Winheight-20,0);
+Screen('Flip',window);
+% 
+% %establish tcpip connection
+hTCPIP=tcpip('0.0.0.0',30000,'NetworkRole','server');
+fopen(hTCPIP);
+
+status=2;
+while status>0
+    Screen('DrawTexture',window,guidelineTex); %show guide-lines to indicate stimuli are ready
+    Screen('Flip',window);
+    
+    %only advance program after button press
+    button=0;
+    while ~any(button)
+        [x y button]=GetMouse(); %wait for button press
+    end
+    while any(button)
+        [x y button]=GetMouse(); %wait for release
+    end
+    
+    
+    Screen('DrawTexture',window,backgroundTex_mix);
+    Screen('Flip',window);
+    
+    status=2;
+    while status==2 %look until mouse click
+        
+        %wait for 2 bytes
+        %after receiving the 2 bytes, start timer and after 3 seconds show the
+        %stimulus encoded in the 2 bytes (position, frequency)
+        
+        while hTCPIP.BytesAvailable<2
+            [x y button]=GetMouse(); %this will generally add less than 1ms to delay after data is received
+            if any(button)
+                if button(2)
+                    status=0; %exit
+                else
+                    status=1; %back to guide screen
+                end
+                break;
+            end
+        end
+        tic; %time when commands were received
+        if status~=2
+            break; %finish
+        end
+        command=fread(hTCPIP,2); %2 byte command (If I don't specify 2 bytes the read is really slow)
+        %byte 1 codes location 1nasal 2peripheral 3fullscreen
+        %byte 2 codes stimulus#
+        
+        stimloc=command(1);
+        stimin=command(2);
+        
+        stimin=stimin+1;
+
+        if stimin>length(contrasts) %if requested stimulus is not 'valid' use the easiest stimulus
+            stimin=length(contrasts);
+        end
+        
+        while toc<3 %wait 3 seconds and then display stimulus right after
+        end
+       
+        for fri=1:size(stimtex,2) %show all frames
+            Screen('DrawTexture',window,stimtex(stimin,fri));
+            Screen('DrawTexture',window,backgroundTex_mix,maskrect(stimloc,:),maskrect(stimloc,:)); %cover up part of the stim that's not to be shown
+            Screen('Flip',window);
+        end
+        
+        Screen('DrawTexture',window,backgroundTex_mix); %show background tex to indicate connection established
+        Screen('Flip',window);
+    end
+    
+    while any(button)
+        [x y button]=GetMouse(); %wait for release
+    end
+    
+end
+% 
+%cleanup: close textures, close tcpip, close screen. 
+
+fclose(hTCPIP);
+
+Screen('Close',stimtex(:));
+Screen('CloseAll');
+ShowCursor();
+clear;

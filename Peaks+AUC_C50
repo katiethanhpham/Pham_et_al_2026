@@ -1,0 +1,287 @@
+%% Naka-Rushton Batch Fitter (Final Refined Version)
+% This script fits a 4-parameter Naka-Rushton function to N neurons'
+% contrast-response data. It applies two filters for robust analysis:
+% 1. R^2 threshold (must explain at least 50% of variance).
+% 2. C50 maximum (must be less than 100).
+% It requires the MATLAB Optimization Toolbox.
+
+% --- USER DATA ---
+% Example data (1 neuron, 7 contrasts)
+contrasts = [0 4 8 16 32 64 85];
+responses = aucMatrix; %mannually input before running
+% responses = peakMatrix; %mannually input before running
+
+% --- End User Data ---
+
+contrasts = double(contrasts(:));   % make row vector and ensure double
+responses = double(responses);
+
+% --- Settings ---
+
+R2_THRESHOLD = 0.8;     % Filter 1: Minimum R2 for a fit to be considered reliable
+C50_MAX      = 100;     % Filter 2: Maximum acceptable C50 value (contrast saturation)
+
+% --- Prepare data ---
+contrasts = contrasts(:)';   % make row vector
+nC = numel(contrasts);
+[rows, cols] = size(responses);
+if rows == nC
+    responses = responses';  % make neurons x contrasts
+elseif cols ~= nC
+    error('responses must be neurons x nContrasts OR nContrasts x neurons');
+end
+nNeurons = size(responses,1);
+
+% --- Allocate results ---
+params   = nan(nNeurons,4); % [Rmax, C50, n, baseline]
+C50      = nan(nNeurons,1); % Dedicated C50 vector for filtering
+R2       = nan(nNeurons,1);
+RMSE     = nan(nNeurons,1);
+fitted   = nan(nNeurons,nC);
+
+% --- Model setup ---
+% p(1) = Rmax, p(2) = C50, p(3) = n, p(4) = baseline
+nrModel = @(p,C) p(1) .* (C.^p(3)) ./ (C.^p(3) + p(2).^p(3)) + p(4);
+
+% Define bounds: [Rmax, C50, n, baseline]
+lb = [0, 1e-6, 0.1, -Inf]; 
+ub = [max(responses(:))*10, max(contrasts)*10, 10, max(responses(:))*10];
+
+% Define options for lsqcurvefit
+options = optimoptions('lsqcurvefit','Display','off','MaxIterations',2000);
+
+% --- Fit loop ---
+for i = 1:nNeurons
+    y = responses(i,:);
+    valid = ~isnan(y) & ~isnan(contrasts);
+    C = contrasts(valid);
+    Y = y(valid);
+    
+    % Skip neuron if not enough data
+    if numel(Y) < 4 
+        continue;
+    end
+    
+    % --- Initial guesses (p0) ---
+    %p(4)
+    baseline0 = min(Y);
+    
+    %p(1)
+    Rmax0 = max(Y) - baseline0;
+    if Rmax0 <= 0, Rmax0 = max(Y); end 
+    
+    %p(2)
+    % hard coded C50 no good
+    % C50guess = 50;
+
+    % Smart C50 guess: interpolate to find contrast at half-max
+    % halfMax = baseline0 + Rmax0/2;
+    % C_gt_0 = C(C>0);
+    % Y_gt_0 = Y(C>0);
+    % if numel(C_gt_0) > 1
+    %     C50guess = interp1(Y_gt_0, C_gt_0, halfMax, 'linear', 'extrap');
+    % else
+    %     C50guess = median(C(C>0));
+    % end
+    % % Clean up C50 guess if it's bad
+    % if isnan(C50guess) || C50guess <= 0 || ~isreal(C50guess)
+    %      C50guess = median(C(C>0));
+    %      if isempty(C50guess) || C50guess <= 0, C50guess = 50; end
+    % end
+
+    % Find the index of the response closest to halfMax
+    halfMax = baseline0 + Rmax0/2;
+    [~, closestIdx] = min(abs(Y - halfMax));
+    C50guess = C(closestIdx);
+
+    % Safety check: if it picked 0% contrast, bump it to the lowest non-zero contrast
+    if C50guess <= 0
+        C50guess = min(C(C>0)); 
+    end
+    
+
+    %p(3)
+    n0 = 1; % Standard initial guess for n, changed from 2 set by Gemini
+    
+    %final vector of parameters
+    p0 = [Rmax0, C50guess, n0, baseline0];
+    
+    % --- Fit ---
+    [pfit,~,~] = lsqcurvefit(nrModel, p0, C, Y, lb, ub, options);
+    
+    % --- Goodness of fit calculation ---
+    SST = sum((Y - mean(Y)).^2); 
+    SSE = sum((nrModel(pfit,C) - Y).^2);
+    R2(i) = 1 - SSE/SST;
+    RMSE(i) = sqrt(SSE/numel(Y));
+
+    % --- Store Results ---
+    params(i,:) = pfit;
+    fitted(i,:) = nrModel(pfit, contrasts);
+    C50(i) = pfit(2); % Store C50 separately before filtering
+end
+
+% --- Calculate Robust Slopes (10% to 90% Dynamic Range) ---
+validC50s = params(:,2) > 0;
+slopes = nan(nNeurons, 1);
+
+% Extract parameters for clean vectorized math
+Rmax_vals = params(validC50s, 1);
+C50_vals  = params(validC50s, 2);
+n_vals    = params(validC50s, 3);
+
+% Calculate the contrasts at 10% and 90% response
+C90 = C50_vals .* (9 .^ (1 ./ n_vals));
+C10 = C50_vals .* ((1/9) .^ (1 ./ n_vals));
+
+% Calculate dynamic range slope (Rise / Run)
+slopes(validC50s) = (0.8 .* Rmax_vals) ./ (C90 - C10);
+
+% --- Apply Filters to C50 and Slopes Results ---
+
+% % 1. Identify failing fits using logical indexing
+badR2Idx = R2 < R2_THRESHOLD; 
+
+% badC50Idx = C50 > C50_MAX;
+% % Combine all bad indices
+% badAllIdx = badR2Idx | badC50Idx;
+
+% Evaluate the fitted curves exactly at 85% contrast
+response_at_max = params(:,1) .* (85.^params(:,3)) ./ (85.^params(:,3) + params(:,2).^params(:,3));
+% Calculate the ratio of the response at 85% to the theoretical Rmax (params(:,1))
+% If the ratio is less than 0.90 (90%), the curve hasn't saturated
+saturationRatio = response_at_max ./ params(:,1);
+nonSaturatingIdx = saturationRatio < 0.90; 
+% Combine all bad indices
+badAllIdx = badR2Idx | nonSaturatingIdx;
+
+% Print filtering summary BEFORE deleting, so we can track original totals
+fprintf('Filtering Complete:\n');
+fprintf(' - %d fits removed due to R2 < %.2f.\n', sum(badR2Idx), R2_THRESHOLD);
+% fprintf(' - %d additional fits removed due to C50 > %.0f.\n', sum(badC50Idx & ~badR2Idx), C50_MAX);
+
+% 2. Delete the invalid cells completely from the arrays
+C50(badAllIdx) = NaN; %replace NaN with [] if want to delete
+slopes(badAllIdx) = NaN; 
+params(badAllIdx,:) = NaN; 
+
+% Paste into Google Sheet for analyzing means after deleting NaN cells.
+
+
+%% --- Plot All Valid Fits ---
+plotAllFitsSummary = false; % Enable/disable the final summary plot
+
+if plotAllFitsSummary
+    % 1. Find all valid (non-filtered) neuron indices
+    validIdx = find(~isnan(C50));
+    nValid = numel(validIdx);
+    
+    if nValid > 0
+        % 2. Generate high-resolution curves for all valid neurons
+        Cfine = linspace(min(contrasts), 100, 200);
+        allCurves = zeros(nValid, numel(Cfine)); % Pre-allocate
+        
+        for k = 1:nValid
+            neuronIndex = validIdx(k);
+            allCurves(k, :) = nrModel(params(neuronIndex, :), Cfine);
+        end
+        
+        % 3. --- Plot everything ---
+        figure; 
+        hold on;
+        
+        % Plot all individual curves in light grey
+        % Plotting the transpose allCurves' is a fast way to plot all rows
+        plot(Cfine, allCurves', 'Color', [0 0 1], 'HandleVisibility', 'off');
+        
+        hold off;
+        xlim([0 100])
+        xlabel('Contrast');
+        ylabel('Response');
+        title(sprintf('All Valid Population Fits (n=%d)', nValid));
+        box off;     
+    else
+        disp('No valid fits found. Skipping summary plot.');
+    end
+end
+
+%% Plotting ave fits
+plotIndividualFits  = true;    % Toggle to show/hide the gray individual fit lines in the summary plot
+
+% --- Plotting: Average Fit with SEM (Extrapolated to 100%) ---
+C_smooth = linspace(0, 100, 100);
+validParams = params(~badAllIdx, :);
+nValid = size(validParams, 1);
+
+smoothCurves = nan(nValid, length(C_smooth));
+
+figure('Name', 'Average Naka-Rushton Fit', 'Color', 'w');
+hold on;
+
+% Generate smooth curves and plot individual fits if toggled on
+for v = 1:nValid
+    p = validParams(v, :);
+    smoothCurves(v, :) = p(1) .* (C_smooth.^p(3)) ./ (C_smooth.^p(3) + p(2).^p(3)) + p(4);
+    
+    if plotIndividualFits
+        plot(C_smooth, smoothCurves(v, :), 'Color', [0.7 0.7 0.7], 'LineWidth', 1);
+    end
+end
+
+% Calculate Mean and SEM across valid neurons
+meanCurve = mean(smoothCurves, 1);
+semCurve = std(smoothCurves, 0, 1) / sqrt(nValid);
+
+% Plot Average Fit and SEM boundaries
+plot(C_smooth, meanCurve, 'k-', 'LineWidth', 2);
+plot(C_smooth, meanCurve + semCurve, 'k:', 'LineWidth', 2);
+plot(C_smooth, meanCurve - semCurve, 'k:', 'LineWidth', 2);
+
+% Formatting
+xlabel('Contrast (%)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Response Amplitude', 'FontSize', 12, 'FontWeight', 'bold');
+title(sprintf('Average Naka-Rushton Fit (n = %d Valid Neurons)', nValid), 'FontSize', 14);
+
+set(gca, 'TickDir', 'out', 'Box', 'off', 'LineWidth', 1.5);
+xlim([0 100]); 
+
+hold off;
+
+
+
+%% --- Plot examples ---
+plotExamples = true;    % plot first few fits
+exampleN     = 9;       % number of example neurons to plot
+if plotExamples
+    % Only consider neurons with valid C50 after filtering
+    exIdx = find(~isnan(C50)); 
+    
+    if numel(exIdx) > exampleN
+        exIdx = exIdx(1:exampleN);
+    end
+    
+    % Create figure
+    if ~isempty(exIdx)
+        figure;
+        nrows = ceil(sqrt(numel(exIdx))); 
+        ncols = ceil(numel(exIdx)/nrows);
+
+        for k = 1:numel(exIdx)
+            i = exIdx(k);
+            subplot(nrows,ncols,k)
+            y = responses(i,:);
+            plot(contrasts, y, 'o', 'MarkerFaceColor','auto'); hold on
+            Cfine = linspace(min(contrasts), max(contrasts), 200);
+            
+            % Plot fit using the stored parameters
+            plot(Cfine, nrModel(params(i,:), Cfine), '-','LineWidth',1.5)
+            
+            xlabel('Contrast'); ylabel('Response')
+            title(sprintf('Neuron %d | C50=%.3g | R^2=%.2f', i, C50(i), R2(i)))
+        end
+    else
+        disp('No valid fits to plot after all filtering steps.');
+    end
+end
+
+

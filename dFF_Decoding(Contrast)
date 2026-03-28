@@ -308,15 +308,47 @@ saveName = fullfile(folderPath, 'Master_Decoding_Summary.csv');
 writetable(MasterTable, saveName);
 disp('Master summary CSV saved.');
 
-%% =========================================================================
-% LABELING DECODED DATA (Time-Series Formatting)
+%% 
+% =========================================================================
+% STANDALONE TIME-SERIES EXTRACTOR: Get Decoding Curves for Plotting
 % =========================================================================
 disp('--- Starting Time-Series Extraction ---');
 
+% 1. Setup & Search (THE MISSING PIECE)
+folderPath = uigetdir(pwd, 'Select the ContrastNeuralAnalyzed Master Folder');
+if folderPath == 0; return; end
+
+allResultFiles = dir(fullfile(folderPath, '**', 'DECODING_RESULTS_BATCH.mat'));
+
+if isempty(allResultFiles)
+    error('CRITICAL ERROR: Could not find any DECODING_RESULTS_BATCH.mat files.');
+end
+
+% STRICT FILTER: Keep only r1, r3, r11
+keepMask = false(length(allResultFiles), 1);
+for i = 1:length(allResultFiles)
+    parts = split(allResultFiles(i).folder, filesep);
+    idx = find(strcmp(parts, 'suite2p'), 1, 'last');
+    if ~isempty(idx) && idx > 1
+        recID = parts{idx-1};
+        if ismember(recID, {'r1', 'r3', 'r11'})
+            keepMask(i) = true;
+        end
+    end
+end
+resultFiles = allResultFiles(keepMask);
+nFiles = length(resultFiles);
+
+if nFiles == 0
+    error('CRITICAL ERROR: No files found matching r1, r3, or r11.'); 
+end
+
+fprintf('Found %d targeted result files. Extracting traces...\n', nFiles);
+
+% 2. Extraction (YOUR CODE)
 extractedData = struct('label', {}, 'trace', {});
 data_idx = 1;
 
-% *** ADDED STIMULUS 6 TO CONDITIONS LIST HERE ***
 stim_conditions = {'Stim0_vs_2', 'Stim0_vs_3', 'Stim0_vs_4', 'Stim0_vs_5', 'Stim0_vs_6'};
 
 for i = 1:nFiles 
@@ -351,6 +383,7 @@ for i = 1:nFiles
     end
 end
 
+% 3. Final Formatting
 if ~isempty(extractedData)
     N = length(extractedData);
     trace_length = length(extractedData(1).trace); 
@@ -360,7 +393,13 @@ if ~isempty(extractedData)
         finalDataMatrix{i, 1} = extractedData(i).label;
         finalDataMatrix(i, 2:end) = num2cell(extractedData(i).trace(:)');
     end
-    fprintf('Success! Formatted %d traces into a %dx%d cell array.\n', N, size(finalDataMatrix, 1), size(finalDataMatrix, 2));
+    fprintf('\n--------------------------------------------------\n');
+    fprintf('SUCCESS! Formatted %d traces into a %dx%d cell array.\n', N, size(finalDataMatrix, 1), size(finalDataMatrix, 2));
+    fprintf('The variable "finalDataMatrix" is now ready in your workspace.\n');
+    fprintf('--------------------------------------------------\n');
 else
     warning('No valid traces were extracted.');
 end
+
+
+

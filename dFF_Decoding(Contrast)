@@ -401,5 +401,19 @@ else
     warning('No valid traces were extracted.');
 end
 
+% =========================================================================
+% GENERATE X-AXIS IN SECONDS FOR PLOTTING
+% =========================================================================
 
+% 1. DEFINE YOUR FRAME RATE 
+% (Change this to your microscope's actual acquisition rate! e.g., 15.5 or 30)
+frameRate = 30; 
+
+% 2. Calculate the time axis based on the NDT binning parameters
+% The NDT used a 5-frame bin, sliding by 2 frames.
+% Your baseline window started at -60 frames.
+time_axis_frames = -60 + (0:(trace_length - 1)) * 2 + 2.5;
+
+% 3. Convert frames to seconds
+time_axis_seconds = time_axis_frames / frameRate;
 
